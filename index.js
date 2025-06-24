@@ -1,6 +1,13 @@
 const express = require("express");
 const { Pool } = require("pg");
 const app = express();
+
+// Logging Middleware (moved to top)
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`, req.body);
+  next();
+});
+
 app.use(express.urlencoded({ extended: true }));
 
 // PostgreSQL connection
@@ -18,7 +25,7 @@ const STATES = {
   PREVIOUS_RECORD: 'PREVIOUS_RECORD'
 };
 
-// Messages (shortened)
+// Messages
 const MESSAGES = {
   en: {
     welcome: "Welcome to BMI App\n1. English\n2. Kinyarwanda",
@@ -99,113 +106,204 @@ function getBMITips(bmi, lang) {
 app.post("/", async (req, res) => {
   const { sessionId, phoneNumber, text } = req.body;
   let steps = text.trim() === "" ? [] : text.trim().split("*");
-  let input = steps[steps.length - 1];
-  let currentStep = steps.length;
-
-  if (input === "0" && currentStep > 1) {
-    steps = steps.slice(0, -2);
-    currentStep = steps.length;
-    input = steps[steps.length - 1] || "";
-  }
+  let input = steps[steps.length - 1] || "";
+  
+  console.log(`Processing request for ${phoneNumber}, steps: ${JSON.stringify(steps)}, input: ${input}`);
 
   try {
+    // Get user from database
     const { rows } = await pool.query("SELECT * FROM users WHERE phone_number = $1", [phoneNumber]);
-    const user = rows[0];
+    let user = rows[0];
 
-    // State Logic
-    let currentState;
-    if (!user) {
-      currentState = currentStep === 0 ? STATES.LANGUAGE_SELECTION : STATES.WEIGHT_INPUT;
-    } else {
-      switch (user.current_state) {
-        case STATES.LANGUAGE_SELECTION: currentState = STATES.PREVIOUS_RECORD; break;
-        case STATES.PREVIOUS_RECORD: currentState = steps[1] === '1' ? STATES.WEIGHT_INPUT : null; break;
-        case STATES.WEIGHT_INPUT: currentState = STATES.HEIGHT_INPUT; break;
-        case STATES.HEIGHT_INPUT: currentState = STATES.BMI_RESULT; break;
-        case STATES.BMI_RESULT: currentState = STATES.TIPS_SELECTION; break;
-        case STATES.TIPS_SELECTION: currentState = null; break;
-        default: currentState = STATES.PREVIOUS_RECORD; break;
+    // Handle back navigation
+    if (input === "0" && steps.length > 1) {
+      if (user) {
+        // Navigate back based on current state
+        switch (user.current_state) {
+          case STATES.HEIGHT_INPUT:
+            await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.WEIGHT_INPUT, user.id]);
+            return res.send("CON " + getMessage(user.language, 'weight_input'));
+          
+          case STATES.BMI_RESULT:
+            await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.HEIGHT_INPUT, user.id]);
+            return res.send("CON " + getMessage(user.language, 'height_input'));
+          
+          case STATES.TIPS_SELECTION:
+            // Go back to showing BMI result
+            const { rows: resultRows } = await pool.query("SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1", [user.id]);
+            if (resultRows.length > 0) {
+              const result = resultRows[0];
+              const status = getBMIStatus(result.bmi, user.language);
+              await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.BMI_RESULT, user.id]);
+              return res.send("CON Your BMI is " + result.bmi + ". " + status + "\n" + getMessage(user.language, 'tips_question'));
+            }
+            break;
+          
+          default:
+            if (user.current_state === STATES.WEIGHT_INPUT) {
+              // Go back to previous record or language selection
+              const { rows: recordRows } = await pool.query("SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1", [user.id]);
+              if (recordRows.length > 0) {
+                await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.PREVIOUS_RECORD, user.id]);
+                const r = recordRows[0];
+                const status = getBMIStatus(r.bmi, user.language);
+                const message = `Last BMI: ${r.bmi} (${status})\nWeight: ${r.weight}kg, Height: ${r.height}cm\n${getMessage(user.language, 'new_check')}`;
+                return res.send("CON " + message);
+              } else {
+                await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.LANGUAGE_SELECTION, user.id]);
+                return res.send("CON " + getMessage('en', 'welcome'));
+              }
+            }
+            break;
+        }
       }
+      return res.send("CON " + getMessage('en', 'welcome'));
     }
 
-    const lang = user ? user.language : (steps[0] === "2" ? "rw" : "en");
+    // Determine current state and language
+    let currentState;
+    let lang = 'en';
 
+    if (steps.length === 0) {
+      // First interaction
+      currentState = STATES.LANGUAGE_SELECTION;
+    } else if (steps.length === 1 && (steps[0] === "1" || steps[0] === "2")) {
+      // Language selected
+      lang = steps[0] === "2" ? "rw" : "en";
+      
+      if (!user) {
+        // Create new user
+        const { rows: newUserRows } = await pool.query(
+          "INSERT INTO users (phone_number, language, current_state) VALUES ($1, $2, $3) RETURNING *",
+          [phoneNumber, lang, STATES.PREVIOUS_RECORD]
+        );
+        user = newUserRows[0];
+      } else {
+        // Update existing user language
+        await pool.query("UPDATE users SET language = $1, current_state = $2 WHERE id = $3", 
+          [lang, STATES.PREVIOUS_RECORD, user.id]);
+        user.language = lang;
+        user.current_state = STATES.PREVIOUS_RECORD;
+      }
+      
+      currentState = STATES.PREVIOUS_RECORD;
+    } else {
+      // Continuing with existing user
+      if (!user) {
+        return res.send("END " + getMessage('en', 'db_error'));
+      }
+      lang = user.language;
+      currentState = user.current_state;
+    }
+
+    // Process based on current state
     switch (currentState) {
       case STATES.LANGUAGE_SELECTION:
         return res.send("CON " + getMessage('en', 'welcome'));
 
-      case STATES.WEIGHT_INPUT:
-        if (!user) {
-          await pool.query("INSERT INTO users (phone_number, language, current_state) VALUES ($1, $2, $3)",
-            [phoneNumber, lang, STATES.WEIGHT_INPUT]);
-        } else {
+      case STATES.PREVIOUS_RECORD:
+        // Check if user has previous records
+        const { rows: records } = await pool.query("SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1", [user.id]);
+        
+        if (records.length > 0 && steps.length === 1) {
+          // Show previous record
+          const r = records[0];
+          const status = getBMIStatus(r.bmi, lang);
+          const message = `Last BMI: ${r.bmi} (${status})\nWeight: ${r.weight}kg, Height: ${r.height}cm\n${getMessage(lang, 'new_check')}`;
+          return res.send("CON " + message);
+        } else if (input === "1") {
+          // Start new check
           await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.WEIGHT_INPUT, user.id]);
+          return res.send("CON " + getMessage(lang, 'weight_input'));
+        } else if (input === "2") {
+          // Exit
+          return res.send("END " + getMessage(lang, 'thank_you'));
+        } else if (records.length === 0) {
+          // No previous records, go directly to weight input
+          await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.WEIGHT_INPUT, user.id]);
+          return res.send("CON " + getMessage(lang, 'weight_input'));
+        } else {
+          return res.send("CON " + getMessage(lang, 'invalid_input') + "\n" + getMessage(lang, 'new_check'));
         }
-        return res.send("CON " + getMessage(lang, 'weight_input'));
 
-      case STATES.HEIGHT_INPUT:
+      case STATES.WEIGHT_INPUT:
         if (!validateWeight(input)) {
           return res.send("CON " + getMessage(lang, 'invalid_weight'));
         }
+        // Valid weight, move to height input
         await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.HEIGHT_INPUT, user.id]);
         return res.send("CON " + getMessage(lang, 'height_input'));
 
-      case STATES.BMI_RESULT:
+      case STATES.HEIGHT_INPUT:
         if (!validateHeight(input)) {
           return res.send("CON " + getMessage(lang, 'invalid_height'));
         }
-        const weight = parseFloat(steps[steps.length - 2]);
+        
+        // Get weight from previous step
+        const weightStep = steps[steps.length - 2];
+        if (!validateWeight(weightStep)) {
+          await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.WEIGHT_INPUT, user.id]);
+          return res.send("CON " + getMessage(lang, 'weight_input'));
+        }
+        
+        const weight = parseFloat(weightStep);
         const height = parseFloat(input);
         const bmi = calculateBMI(weight, height);
         const status = getBMIStatus(bmi, lang);
+        
+        // Save result
         await pool.query("INSERT INTO results (user_id, weight, height, bmi) VALUES ($1, $2, $3, $4)",
           [user.id, weight, height, bmi]);
+        
+        // Update state
         await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.BMI_RESULT, user.id]);
+        
         return res.send("CON Your BMI is " + bmi + ". " + status + "\n" + getMessage(lang, 'tips_question'));
 
-      case STATES.TIPS_SELECTION:
+      case STATES.BMI_RESULT:
+        // This should transition to tips selection
+        await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.TIPS_SELECTION, user.id]);
         if (input === "1") {
-          const { rows } = await pool.query("SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1", [user.id]);
-          const result = rows[0];
+          // Show tips
+          const { rows: resultRows } = await pool.query("SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1", [user.id]);
+          const result = resultRows[0];
           const tips = getBMITips(result.bmi, lang);
           await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.PREVIOUS_RECORD, user.id]);
           return res.send("END " + tips);
         } else if (input === "2") {
+          // No tips
           await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.PREVIOUS_RECORD, user.id]);
           return res.send("END " + getMessage(lang, 'thank_you'));
         } else {
           return res.send("CON " + getMessage(lang, 'invalid_input') + "\n" + getMessage(lang, 'tips_question'));
         }
 
-      case STATES.PREVIOUS_RECORD:
-        const { rows: records } = await pool.query("SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1", [user.id]);
-        if (records.length > 0) {
-          const r = records[0];
-          const status = getBMIStatus(r.bmi, lang);
-          const message = `Last BMI: ${r.bmi} (${status})\nWeight: ${r.weight}kg, Height: ${r.height}cm\n${getMessage(lang, 'new_check')}`;
-          return res.send("CON " + message);
+      case STATES.TIPS_SELECTION:
+        if (input === "1") {
+          // Show tips
+          const { rows: resultRows } = await pool.query("SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1", [user.id]);
+          const result = resultRows[0];
+          const tips = getBMITips(result.bmi, lang);
+          await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.PREVIOUS_RECORD, user.id]);
+          return res.send("END " + tips);
+        } else if (input === "2") {
+          // No tips
+          await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.PREVIOUS_RECORD, user.id]);
+          return res.send("END " + getMessage(lang, 'thank_you'));
         } else {
-          await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.WEIGHT_INPUT, user.id]);
-          return res.send("CON " + getMessage(lang, 'weight_input'));
+          return res.send("CON " + getMessage(lang, 'invalid_input') + "\n" + getMessage(lang, 'tips_question'));
         }
 
-      case null:
-        await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.PREVIOUS_RECORD, user?.id]);
-        return res.send("END " + getMessage(lang, 'thank_you'));
-
       default:
-        return res.send("END " + getMessage(lang, 'invalid_input'));
+        console.error("Unknown state:", currentState);
+        await pool.query("UPDATE users SET current_state = $1 WHERE id = $2", [STATES.PREVIOUS_RECORD, user?.id]);
+        return res.send("END " + getMessage(lang, 'db_error'));
     }
+
   } catch (error) {
     console.error("Fatal error:", error);
     return res.send("END " + getMessage('en', 'db_error'));
   }
-});
-
-// Logging Middleware
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`, req.body);
-  next();
 });
 
 // Start server
